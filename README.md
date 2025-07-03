@@ -19,7 +19,6 @@ A powerful **Streamlit** web app to **intelligently split weekly data that spans
   All non-date and non-numerical columns are duplicated for each partial week, ensuring your data remains complete and consistent.
 
 * **Dual-Engine Performance**    
-
   * **Pandas** for convenient `.xlsx` (Excel) file processing
   * **Polars** for ultra-fast, parallel `.csv` processing—even with large files
 
