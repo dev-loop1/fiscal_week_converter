@@ -13,15 +13,15 @@ DATE_FORMATS = {
     "DD-Mon-YY (e.g., 02-Jan-25)": "%d-%b-%y",
     "D-Mon-YYYY (e.g., 2-Jan-2025)": "%-d-%b-%Y",
     "DD-Mon-YYYY (e.g., 02-Jan-2025)": "%d-%b-%Y",
-    "MM/DD/YY (e.g., 01/02/25)": "%m/%d/%y",
-    "MM/DD/YYYY (e.g., 01/02/2025)": "%m/%d/%Y",
-    "DD/MM/YY (e.g., 02/01/25)": "%d/%m/%y",
-    "DD/MM/YYYY (e.g., 02/01/2025)": "%d/%m/%Y",
-    "YYYY-MM-DD (e.g., 2025-01-02)": "%Y-%m-%d",
+    "MM/DD/YY (e.g., 01/31/25)": "%m/%d/%y",
+    "MM/DD/YYYY (e.g., 01/31/2025)": "%m/%d/%Y",
+    "DD/MM/YY (e.g., 31/01/25)": "%d/%m/%y",
+    "DD/MM/YYYY (e.g., 31/01/2025)": "%d/%m/%Y",
+    "YYYY-MM-DD (e.g., 2025-01-31)": "%Y-%m-%d",
 }
 
 
-# --- Engine 1: Polars for CSV File Handling ---
+# --- Engine 1: Polars for CSVs ---
 def process_data_with_polars(source_file, date_col, value_col, date_format):
     """Processes the entire file using the Polars engine and a user-selected date format."""
     lf = pl.scan_csv(source_file, infer_schema_length=0).with_row_index(name="_row_index")
@@ -31,7 +31,7 @@ def process_data_with_polars(source_file, date_col, value_col, date_format):
         pl.col(date_col).str.to_date(format=date_format, strict=True).alias("date_obj"),
         pl.col(value_col).cast(pl.Float64, strict=False)
     )
-    
+
     split_mask = (
         (pl.col("date_obj").is_not_null()) & (pl.col("date_obj").dt.day() >= 23) &
         (pl.col("date_obj").dt.month() != (pl.col("date_obj") + pl.duration(days=6)).dt.month())
@@ -52,48 +52,45 @@ def process_data_with_polars(source_file, date_col, value_col, date_format):
         (pl.col("last_day_of_month") + pl.duration(days=1)).alias("date_obj"),
         pl.col("second_week_value").alias(value_col),
     )
-    
+
     cols_to_keep_for_concat = lf.collect_schema().names()
     final_lf = pl.concat([
         lf_no_split, lf_split1.select(cols_to_keep_for_concat), lf_split2.select(cols_to_keep_for_concat)
     ]).sort("_row_index")
-    
+
     final_lf = final_lf.with_columns(
-        pl.col("date_obj").dt.strftime(date_format).alias(f"Partial {date_col}")
+        pl.col("date_obj").dt.strftime(date_format).alias("Time.[Partial Week]")
     ).drop("date_obj", "_row_index")
-    
-    final_col_order = [f"Partial {date_col}" if col == date_col else col for col in original_cols if col != "_row_index"]
+
+    final_col_order = ["Time.[Partial Week]" if col == date_col else col for col in original_cols if col != "_row_index"]
     return final_lf.select(final_col_order).collect()
 
 
 # --- Engine 2: Pandas for Excel ---
 def process_data_with_pandas(df, date_col, value_col, date_format):
     """Processes a DataFrame using a vectorized pandas approach with a platform-safe fix."""
-    # This flag identifies the specific case that fails on Windows
-    is_windows_non_padded_day = platform.system() == "Windows" and '%-d' in date_format
+    safe_date_format = date_format
+    if platform.system() == "Windows" and '%-d' in date_format:
+        safe_date_format = date_format.replace('%-d', '%#d')
 
-    # Let pandas' flexible parser handle the input
     df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
-    start_dates = pd.to_datetime(df[date_col], errors='coerce')
-    
+    start_dates = pd.to_datetime(df[date_col], format=safe_date_format, errors='coerce')
+
     actual_split_mask = (start_dates.notna()) & (start_dates.dt.day >= 23) & (start_dates.dt.month != (start_dates + pd.Timedelta(days=6)).dt.month)
-    
+
     df_no_split = df[~actual_split_mask].copy()
     df_to_split = df[actual_split_mask].copy()
-    
-    if df_to_split.empty:
-        # No rows were split, but we must still ensure the output format is correct
-        if not is_windows_non_padded_day:
-             df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.strftime(date_format)
-        # If it IS the windows non-padded case, we don't reformat, preserving the original string
-        return df.rename(columns={date_col: f"Partial {date_col}"})
 
-    split_dates = pd.to_datetime(df_to_split[date_col], errors='coerce')
+    if df_to_split.empty:
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.strftime(safe_date_format)
+        return df.rename(columns={date_col: "Time.[Partial Week]"})
+
+    split_dates = pd.to_datetime(df_to_split[date_col], format=safe_date_format, errors='coerce')
     last_day_of_month = split_dates + pd.offsets.MonthEnd(0)
     days_in_first_week = (last_day_of_month - split_dates).dt.days + 1
     first_week_value = round((df_to_split[value_col] / 7) * days_in_first_week, 2)
     second_week_value = df_to_split[value_col] - first_week_value
-    
+
     df_split1 = df_to_split.copy()
     df_split1[value_col] = first_week_value
     df_split1['_split_order'] = 1
@@ -104,28 +101,24 @@ def process_data_with_pandas(df, date_col, value_col, date_format):
     df_split2['_split_order'] = 2
 
     df_no_split['_split_order'] = 0
-    
+
     result_df = pd.concat([df_no_split, df_split1, df_split2]).sort_index(kind='mergesort').drop(columns=['_split_order'])
-    
-    # --- Manually build the date string for the Windows case ---
+
     temp_dates = pd.to_datetime(result_df[date_col], errors='coerce')
-    if is_windows_non_padded_day:
+    if platform.system() == "Windows" and '%-d' in date_format:
         day = temp_dates.dt.day.astype(str)
         month = temp_dates.dt.strftime('%b')
         year = temp_dates.dt.strftime('%y') if '%y' in date_format and '%Y' not in date_format else temp_dates.dt.strftime('%Y')
         delimiter = '-' if '-' in date_format else '/'
         result_df[date_col] = day + delimiter + month + delimiter + year
     else:
-        # Use the standard, fast strftime for all other cases
         result_df[date_col] = temp_dates.dt.strftime(date_format)
-    
-    return result_df.rename(columns={date_col: f"Partial {date_col}"})
 
+    return result_df.rename(columns={date_col: "Time.[Partial Week]"})
 
 # --- Streamlit Web App ---
-st.set_page_config(layout="wide")
+st.set_page_config(page_title="Fiscal Week Converter", layout="wide")
 st.title(" Fiscal Week Converter")
-# st.write("""This application uses the **Polars** engine for CSVs and the **Pandas** engine for Excel files.""")
 
 uploaded_file = st.file_uploader("Choose a CSV or Excel file", type=["csv", "xlsx"])
 
@@ -133,21 +126,21 @@ if uploaded_file:
     file_extension = uploaded_file.name.split('.')[-1].lower()
 
     if file_extension == 'xlsx' and uploaded_file.size > 100 * 1024 * 1024:
-        st.error("This is a large Excel file. Please convert it to CSV.")
+        st.error("This is a large Excel file. Please convert it to CSV for processing.")
         st.stop()
 
     df_preview = pd.read_csv(uploaded_file, nrows=5, dtype=str) if file_extension == 'csv' else pd.read_excel(uploaded_file, nrows=5, dtype=str)
     uploaded_file.seek(0)
-    st.subheader("Original Data Preview (First 5 Rows)")
+    st.subheader("Data Preview (First 5 Rows)")
     st.dataframe(df_preview)
 
     column_names = df_preview.columns.tolist()
-    
+
     col1, col2, col3 = st.columns(3)
     with col1:
         date_column = st.selectbox("Select the fiscal week starting date column:", column_names)
     with col2:
-        value_column = st.selectbox("Select the value column:", column_names)
+        value_column = st.selectbox("Select the value column to split:", column_names)
     with col3:
         selected_format_name = st.selectbox("Select the date format that matches your file:", list(DATE_FORMATS.keys()))
         date_format_code = DATE_FORMATS[selected_format_name]
@@ -155,13 +148,12 @@ if uploaded_file:
     if st.button("Process File"):
         base_name, extension = os.path.splitext(uploaded_file.name)
         output_filename = f"{base_name}_partial_week_output.{file_extension}"
-        
+
         if file_extension == 'csv':
-            st.info("CSV file detected. Using Polars engine.")
-            with st.spinner("Processing file with Polars parallel engine..."):
+            with st.spinner("Processing file... Please wait."):
                 try:
                     result_df_pl = process_data_with_polars(uploaded_file, date_column, value_column, date_format_code)
-                    
+
                     original_sum = pl.read_csv(uploaded_file, ignore_errors=True)[value_column].sum()
                     processed_sum = result_df_pl[value_column].sum()
                     st.subheader("✅ Verification")
@@ -178,16 +170,15 @@ if uploaded_file:
                     result_df_pl.write_csv(output_buffer)
                     output_buffer.seek(0)
                     st.download_button(label="Download Processed CSV File", data=output_buffer, file_name=output_filename, mime="text/csv")
-                
+
                 except pl.exceptions.ComputeError as e:
                     if "conversion from `str` to `date` failed" in str(e):
-                        st.error(f"**Date Parsing Failed!**\n\nPlease check that the date format you selected in the dropdown ('{selected_format_name}') perfectly matches the format of the dates in your file's '{date_column}' column.")
+                        st.error(f"**Date Parsing Failed!**\n\nPlease check that the date format you selected ('{selected_format_name}') perfectly matches the format in your '{date_column}' column.", icon="🚨")
                     else:
                         st.error(f"An unexpected error occurred during processing: {e}")
 
-        else: 
-            st.info("Excel file detected. Using pandas engine.")
-            with st.spinner("Processing Excel file in memory..."):
+        else: # Excel file path
+            with st.spinner("Processing file... Please wait."):
                 try:
                     df = pd.read_excel(uploaded_file, dtype=str)
                     result_df = process_data_with_pandas(df, date_column, value_column, date_format_code)
@@ -201,11 +192,11 @@ if uploaded_file:
                         st.success("Verification Successful!")
                     else:
                         st.warning("Verification Failed: Sums do not match.")
-                    st.subheader("Processed Data Preview (First 5 Rows)")
+                    st.subheader("Processed Data Preview")
                     st.dataframe(result_df.head())
                     output_buffer = io.BytesIO()
                     with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
                         result_df.to_excel(writer, index=False, sheet_name='Processed_Data')
                     st.download_button(label="Download Processed Excel File", data=output_buffer.getvalue(), file_name=output_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 except Exception as e:
-                     st.error(f"**An error occurred processing the Excel file.**\n\nThis can happen if dates in the '{date_column}' column are in an unexpected format.\n\n*Details: {e}*")
+                     st.error(f"**An error occurred processing the Excel file.**\n\nThis can happen if the selected date format ('{selected_format_name}') does not match the data in the '{date_column}' column. Please verify your selection.\n\n*Details: {e}*")
