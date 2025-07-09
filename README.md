@@ -3,7 +3,7 @@
 # Fiscal Week Converter
 
 A powerful **Streamlit** web app to **intelligently split weekly data that spans across months**, ensuring accurate and proportional reporting of partial weeks.
-
+* **For lighter use, the app is hosted on Streamlit Server.** Access Link: https://fiscalweekconverter.streamlit.app/
 ---
 
 ## Core Features
